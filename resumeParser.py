@@ -1,6 +1,5 @@
 # resume_parser.py
 from datetime import datetime
-import calendar
 import re
 import json
 from pathlib import Path
