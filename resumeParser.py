@@ -1,4 +1,6 @@
 # resume_parser.py
+from datetime import datetime
+import calendar
 import re
 import json
 from pathlib import Path
@@ -147,6 +149,197 @@ def split_sections(text):
     sections["raw"] = joined
     return sections
 
+# === URL extraction ===
+URL_RE = re.compile(r"https?://\S+|www\.\S+")
+SOCIAL_HOSTS = ["linkedin.com", "github.com", "gitlab.com", "behance.net", "dribbble.com", "medium.com", "portfolio"]
+
+def extract_urls(text):
+    urls = set(m.group(0).rstrip('.,;') for m in URL_RE.finditer(text))
+    profile = {"linkedin": None, "github": None, "portfolio": None, "other": []}
+    for u in urls:
+        lu = u.lower()
+        if "linkedin.com" in lu:
+            profile["linkedin"] = u
+        elif "github.com" in lu:
+            profile["github"] = u
+        elif any(host in lu for host in ["behance", "dribbble", "medium", "portfolio", "gitlab"]):
+            profile["portfolio"] = profile["portfolio"] or u
+        else:
+            profile["other"].append(u)
+    return profile
+
+
+# === Summary / Objective ===
+def extract_summary(text, max_lines=6):
+    # take the text before first recognized section header
+    lower = text.lower()
+    sec_pos = len(text)
+    for marker in SECTION_MARKERS:
+        m = re.search(marker, lower)
+        if m:
+            sec_pos = min(sec_pos, m.start())
+    pre = text[:sec_pos].strip()
+    lines = [l for l in pre.splitlines() if l.strip()]
+    # often summary is first 1-3 lines with 30-200 chars
+    candidate_lines = lines[:max_lines]
+    joined = " ".join(candidate_lines)
+    # if joined is too long, keep only first sentence
+    if len(joined) > 400:
+        return joined.split(".")[0] + "."
+    return joined
+
+# === Certifications & Projects ===
+CERT_KEY = re.compile(r"\b(certif|certificat|certificate|certified)\b", re.I)
+PROJECT_KEY = re.compile(r"\bprojects?\b", re.I)
+
+def extract_certifications(text):
+    certs = []
+    # search for lines with certification keywords or common cert names
+    for line in text.splitlines():
+        if CERT_KEY.search(line) or any(k in line.lower() for k in ["aws certified", "google cloud", "tensorflow", "professional certificate", "coursera", "udemy"]):
+            line = line.strip(" -•\t")
+            if 5 < len(line) < 200:
+                certs.append(line)
+    # also look inside 'certifications' section if present
+    # naive section extraction:
+    lower = text.lower()
+    idx = lower.find("cert")
+    if idx != -1:
+        chunk = text[idx: idx + 800]  # grab a window
+        for l in chunk.splitlines():
+            if l.strip() and len(l.strip())>3:
+                if l.strip() not in certs:
+                    certs.append(l.strip())
+    return certs
+
+
+def extract_projects(sections):
+    # sections may be dict from split_sections(); prefer 'projects' key
+    proj_text = ""
+    for k in sections.keys():
+        if "project" in k.lower():
+            proj_text = sections[k]
+            break
+    if not proj_text:
+        # fallback: look for "project" marker anywhere
+        whole = "\n".join(sections.values()) if isinstance(sections, dict) else sections
+        m = PROJECT_KEY.search(whole)
+        if m:
+            proj_text = whole[m.start(): m.start()+1000]
+    projects = []
+    for line in proj_text.splitlines():
+        line = line.strip(" -•\t")
+        if not line: continue
+        # likely a project line if it contains ':' or '—' or 'http' or has a short title
+        if ":" in line or "—" in line or "http" in line or len(line.split()) < 12:
+            projects.append(line)
+    # dedupe
+    return list(dict.fromkeys(projects))
+
+# === Locations (spaCy GPE + heuristics) ===
+def extract_locations(text, top_n=5):
+    doc = nlp(text)
+    locs = []
+    for ent in doc.ents:
+        if ent.label_ in ("GPE", "LOC"):
+            locs.append(ent.text)
+    # fallback: look for "City, State" patterns
+    pattern = re.compile(r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*),\s*([A-Z]{2}|[A-Za-z]{2,})\b")
+    for m in pattern.finditer(text):
+        locs.append(m.group(0))
+    # return top unique
+    uniq = []
+    for l in locs:
+        if l not in uniq:
+            uniq.append(l)
+        if len(uniq) >= top_n:
+            break
+    return uniq
+
+# === Role title extraction (heuristic) ===
+TITLE_KEYWORDS = [
+    "engineer","developer","scientist","researcher","intern","manager","lead","principal",
+    "analyst","architect","consultant","director","assistant","associate","trainer","specialist"
+]
+
+def extract_role_titles(section_text):
+    titles = []
+    # scan lines for title-like patterns
+    for line in section_text.splitlines():
+        clean = line.strip(" -•\t")
+        if not clean: continue
+        low = clean.lower()
+        # pattern: "Title — Company" or "Title at Company" or contains a title keyword
+        if " at " in low or "—" in clean or "|" in clean or any(k in low for k in TITLE_KEYWORDS):
+            # try to isolate the title portion
+            parts = re.split(r"—|-|–|\|| at ", clean)
+            title_cand = parts[0].strip()
+            # short filter
+            if 2 <= len(title_cand.split()) <= 6 and len(title_cand) < 80:
+                titles.append(title_cand)
+    # spaCy fallback: look for PERSON? no — look for nouns preceding ORG
+    doc = nlp(section_text)
+    for sent in doc.sents:
+        for ent in sent.ents:
+            if ent.label_ == "ORG":
+                # take preceding noun chunk
+                start = ent.start
+                if start > 0:
+                    nc = doc[max(0, start-6): start].text.strip()
+                    if any(k in nc.lower() for k in TITLE_KEYWORDS):
+                        titles.append(nc)
+    # dedupe and return
+    out = []
+    for t in titles:
+        if t not in out:
+            out.append(t)
+    return out
+
+# === Years of experience (approx) ===
+YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+MONTH_YEAR_RE = re.compile(r"(?:(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)\s*,?\s*(\d{4})", re.I)
+RANGE_RE = re.compile(r"(?P<start>[\w\s\.\-\/]+?)\s*(?:to|[-–—]|–)\s*(?P<end>[\w\s\.\-\/]+)", re.I)
+
+def parse_year_from_token(tok):
+    # tok might be 'Jan 2018' or '2018'
+    m = YEAR_RE.search(tok)
+    if m:
+        return int(m.group(0))
+    my = MONTH_YEAR_RE.search(tok)
+    if my:
+        return int(my.group(2))
+    return None
+
+def estimate_years_experience(text):
+    now_year = datetime.now().year
+    years = []
+    # find ranges like "Jan 2018 - Mar 2020" or "2015 - present"
+    for m in RANGE_RE.finditer(text):
+        s = m.group("start")
+        e = m.group("end")
+        sy = parse_year_from_token(s) or parse_year_from_token(e) or None
+        ey = None
+        if re.search(r"present|current|now", e, re.I):
+            ey = now_year
+        else:
+            ey = parse_year_from_token(e)
+        if sy and ey:
+            if ey >= sy:
+                years.append((sy, ey))
+    # if no ranges found, fallback to scanning for years and assume earliest->latest
+    if not years:
+        found = sorted({int(y.group(0)) for y in YEAR_RE.finditer(text)})
+        if found:
+            years = [(found[0], found[-1] if found[-1] <= now_year else now_year)]
+    if not years:
+        return 0.0
+    # compute span: earliest start to latest end
+    earliest = min(s for s,e in years)
+    latest = max(e for s,e in years)
+    duration = latest - earliest
+    # return float years
+    return float(duration)
+
 # --- Name extraction (heuristic) --------------------------------------------
 def extract_name(text):
     doc = nlp(text.strip().split("\n")[0])  # try first line
@@ -169,30 +362,61 @@ def parse_education(section_text):
             degrees.append(line.strip())
     return degrees
 
+RANGE_RE = re.compile(r"(?P<start>[\w\s\.\-\/]+?)\s*(?:to|[-–—]|–)\s*(?P<end>[\w\s\.\-\/]+)", re.I)
+DATE_WORDS = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|\d{4}|present|current)\b", re.I)
+
 def parse_experience(section_text):
-    exps = []
-    lines = [l for l in section_text.splitlines() if l.strip()]
-    # naive grouping: lines that start with uppercase likely titles
-    cur = {}
+    if not section_text:
+        return []
+    lines = [l.strip() for l in section_text.splitlines() if l.strip()]
+    entries = []
+    cur = None
     for line in lines:
-        # detect date range
-        if re.search(r"(20\d{2}|19\d{2})", line):
+        # skip lines that are obvious headers/labels
+        if re.fullmatch(r"(experience|work experience|professional experience|personal|internships|projects|skills)", line.lower()):
+            continue
+        # if line looks like a date-only or contains date range, start new entry
+        if DATE_WORDS.search(line) and (RANGE_RE.search(line) or re.search(r"\b(19|20)\d{2}\b", line)):
+            # new entry: attach date info
             if cur:
-                exps.append(cur)
-                cur = {}
-            cur["dates"] = line.strip()
-        elif len(line.split()) <= 6 and line[0].isupper():
-            # likely "Company — Role" or "Role at Company"
-            if cur:
-                exps.append(cur)
-                cur = {}
-            cur["title_or_company"] = line.strip()
+                entries.append(cur)
+            cur = {"dates": line.strip(), "title": None, "company": None, "description": ""}
+            continue
+        # if line contains separators indicating Title — Company or Title, Company
+        if re.search(r"—|-|—|, at | at | \| ", line) and len(line.split()) <= 12:
+            parts = re.split(r"—|-|–|\||, at | at ", line)
+            # first part likely title, second company
+            title = parts[0].strip()
+            company = parts[1].strip() if len(parts) > 1 else None
+            if cur and not cur.get("title"):
+                cur = cur or {}
+                cur.update({"title": title, "company": company})
+                continue
+            else:
+                # start new entry
+                if cur:
+                    entries.append(cur)
+                cur = {"dates": None, "title": title, "company": company, "description": ""}
+                continue
+        # generic description line: attach to current entry; if none, start a loose entry
+        if not cur:
+            cur = {"dates": None, "title": None, "company": None, "description": line}
         else:
-            cur.setdefault("description", "")
-            cur["description"] += " " + line.strip()
+            cur["description"] = (cur.get("description","") + " " + line).strip()
     if cur:
-        exps.append(cur)
-    return exps
+        entries.append(cur)
+    # filter out entries that are just header garbage (like single word "PERSONAL")
+    filtered = []
+    for e in entries:
+        # if entry has no useful info (no title/company/description/dates) skip
+        if not (e.get("title") or e.get("company") or e.get("description") or e.get("dates")):
+            continue
+        # drop entries that are exactly "PERSONAL" or "EXPERIENCE"
+        if (e.get("title") and e["title"].strip().upper() in ("EXPERIENCE", "PERSONAL", "PROJECTS")):
+            continue
+        filtered.append(e)
+    return filtered
+
 
 # --- Skills matching --------------------------------------------------------
 SKILL_VOCAB = [
@@ -217,7 +441,7 @@ def extract_skills(text, vocab=SKILL_VOCAB, score_cutoff=70):
                 found.add(s)
     return sorted(found)
 
-# --- Main --------------------------------------------------------------
+
 def parse_resume(path):
     text = extract_text(path)
     text = re.sub(r"\n{2,}", "\n", text)  # normalize
@@ -228,7 +452,15 @@ def parse_resume(path):
     skills = extract_skills(text)
     education = parse_education(sections.get("education", sections.get("education", "")) if isinstance(sections, dict) else "")
     experience = parse_experience(sections.get("experience", sections.get("work experience", "")) if isinstance(sections, dict) else "")
-
+    urls = extract_urls(text)
+    summary = extract_summary(text)
+    certifications = extract_certifications(text)
+    projects = extract_projects(sections)
+    locations = extract_locations(text)
+    role_titles = extract_role_titles(sections.get('experience', '') if isinstance(sections, dict) else '')
+    years_exp = estimate_years_experience(sections.get('experience', '') if isinstance(sections, dict) else text)
+    
+    
     out = {
         "name": name,
         "email": email,
@@ -237,6 +469,10 @@ def parse_resume(path):
         "education": education,
         "experience": experience,
         # "sections": sections,
+        "linkedin": urls["linkedin"], "github": urls["github"], "portfolio": urls["portfolio"],
+    "certifications": certifications, "projects": projects, "summary": summary,
+    "locations": locations, "role_titles": role_titles, "years_experience": years_exp
+
         # "raw_text_snippet": text[:2000]
     }
     return out
@@ -245,6 +481,6 @@ def parse_resume(path):
 if __name__ == "__main__":
     import sys
     print("Enter the path to the resume: ")
-    p = r"C:\Users\sanke\Downloads\final_Sankeerth_Resume.pdf"
+    p = r"C:\Users\sanke\Desktop\parser\sample_resumes\final_Sankeerth_Resume.pdf"
     parsed = parse_resume(p)
     print(json.dumps(parsed, indent=2))
