@@ -1,1 +1,24 @@
+
+# Python Junk
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+#Environments
 venv/
+.venv/
+env/
+
+
+#secrets
+.env
+.env.local
+.env.*.local
+secrets.json
+api_keys.txt
+
+
+# IDEs
+.vscode/
+.idea/
